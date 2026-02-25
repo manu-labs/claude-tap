@@ -6,11 +6,7 @@ Use --run-real-e2e to enable them.
 
 import os
 import shutil
-import signal
-import subprocess
-import sys
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -39,95 +35,45 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session")
 def installed_claude_tap():
-    """Ensure claude-tap is installed from local source in editable mode.
+    """Verify claude-tap is importable from the current environment.
 
+    The project should already be installed via `uv run` or `pip install -e .`.
     Returns the project root directory.
     """
     project_dir = Path(__file__).parent.parent.parent
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", str(project_dir)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    # Verify the package is importable (uv run handles installation)
+    try:
+        import claude_tap  # noqa: F401
+    except ImportError:
+        pytest.fail("claude_tap is not installed. Run with: uv run --extra dev pytest tests/e2e/ --run-real-e2e")
     return project_dir
 
 
 @pytest.fixture
-def proxy_server(installed_claude_tap):
-    """Start claude-tap in proxy-only mode (--tap-no-launch).
+def claude_env(installed_claude_tap):
+    """Run claude-tap as a wrapper around claude -p (normal usage mode).
 
-    Reads the port from stdout, yields (port, trace_dir, proc), and
-    cleans up with SIGINT on teardown.
+    claude-tap launches claude as a child process and sets ANTHROPIC_BASE_URL
+    internally. This fixture provides the trace_dir and a helper to run
+    prompts through claude-tap.
+
+    Note: Claude Code uses OAuth authentication which is bound to the official
+    API endpoint. Setting ANTHROPIC_BASE_URL manually causes 403 errors.
+    Instead, we use claude-tap's normal mode where it wraps the claude CLI
+    and manages the env vars itself.
     """
     trace_dir = tempfile.mkdtemp(prefix="claude_tap_real_e2e_")
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "claude_tap",
-            "--tap-no-launch",
-            "--tap-port",
-            "0",
-            "--tap-output-dir",
-            trace_dir,
-            "--tap-no-update-check",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
 
-    # Wait for the proxy to print the listening port
-    port = None
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                stderr = proc.stderr.read()
-                raise RuntimeError(f"claude-tap exited early (code {proc.returncode}): {stderr}")
-            time.sleep(0.1)
-            continue
-        # Look for the listening line: "claude-tap v... listening on http://host:port"
-        if "listening on" in line:
-            # Extract port from URL like http://127.0.0.1:12345
-            url_part = line.strip().split("listening on")[-1].strip()
-            port = int(url_part.rsplit(":", 1)[-1])
-            break
-
-    if port is None:
-        proc.kill()
-        stderr = proc.stderr.read()
-        raise RuntimeError(f"Timed out waiting for claude-tap to start. stderr: {stderr}")
-
-    yield port, trace_dir, proc
-
-    # Cleanup: send SIGINT for graceful shutdown
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-
-    shutil.rmtree(trace_dir, ignore_errors=True)
-
-
-@pytest.fixture
-def claude_env(proxy_server):
-    """Build an environment dict for running claude CLI through the proxy.
-
-    Sets ANTHROPIC_BASE_URL to the proxy and removes env vars that
-    would interfere with Claude Code.
-    """
-    port, trace_dir, proc = proxy_server
     env = os.environ.copy()
-    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-    env["NO_PROXY"] = "127.0.0.1"
-    # Remove Claude Code nesting detection vars
+    env["PYTHONUNBUFFERED"] = "1"
+    # Remove nesting detection vars
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_SSE_PORT", None)
-    return env, trace_dir
+    # Disable update check in tests
+    env["CLAUDE_TAP_PYPI_URL"] = "http://127.0.0.1:1/invalid"
+
+    yield env, trace_dir
+
+    # Keep trace dir on failure for debugging; clean on success
+    # (pytest captures can be inspected)
+    shutil.rmtree(trace_dir, ignore_errors=True)

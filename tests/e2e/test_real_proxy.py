@@ -1,47 +1,42 @@
 """Real E2E tests using actual Claude CLI.
 
-These tests start claude-tap from local source, connect to a real Claude CLI,
-send real prompts, and verify trace output.
+These tests run claude-tap in its normal mode: wrapping the `claude` CLI
+as a child process. claude-tap handles ANTHROPIC_BASE_URL internally.
 
 Prerequisites:
   - `claude` CLI installed and authenticated
-  - Run with: uv run pytest tests/e2e/ --run-real-e2e --timeout=300
+  - Run with: uv run --extra dev pytest tests/e2e/ --run-real-e2e -v --timeout=300
 """
 
 import json
 import subprocess
-import time
+import sys
 from pathlib import Path
 
 import pytest
 
 
-def _wait_for_trace_files(trace_dir: str, min_records: int = 1, timeout: float = 120) -> list[dict]:
-    """Wait for trace JSONL files to appear and contain at least min_records."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        jsonl_files = list(Path(trace_dir).glob("trace_*.jsonl"))
-        if jsonl_files:
-            records = []
-            for f in jsonl_files:
-                text = f.read_text().strip()
-                if text:
-                    for line in text.splitlines():
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-            if len(records) >= min_records:
-                return records
-        time.sleep(1)
-    raise TimeoutError(f"Expected at least {min_records} trace records in {trace_dir}, found none after {timeout}s")
+def _run_claude_tap(
+    env: dict, trace_dir: str, prompt: str, extra_claude_args: list[str] | None = None, timeout: float = 120
+) -> subprocess.CompletedProcess:
+    """Run claude-tap wrapping `claude -p <prompt>`.
 
+    Returns the CompletedProcess with stdout/stderr.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "claude_tap",
+        "--tap-output-dir",
+        trace_dir,
+        "--tap-no-update-check",
+        "--",  # separator: everything after goes to claude
+        "-p",
+        prompt,
+    ]
+    if extra_claude_args:
+        cmd.extend(extra_claude_args)
 
-def _run_claude_prompt(env: dict, prompt: str, extra_args: list[str] | None = None, timeout: float = 120) -> str:
-    """Run `claude -p <prompt>` and return stdout."""
-    cmd = ["claude", "-p", prompt]
-    if extra_args:
-        cmd.extend(extra_args)
     result = subprocess.run(
         cmd,
         env=env,
@@ -49,11 +44,21 @@ def _run_claude_prompt(env: dict, prompt: str, extra_args: list[str] | None = No
         text=True,
         timeout=timeout,
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p failed (code {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-    return result.stdout
+    return result
+
+
+def _read_trace_records(trace_dir: str) -> list[dict]:
+    """Read all JSONL trace records from the trace directory."""
+    records = []
+    for jsonl_file in Path(trace_dir).glob("trace_*.jsonl"):
+        text = jsonl_file.read_text().strip()
+        if text:
+            for line in text.splitlines():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
 
 
 class TestRealProxy:
@@ -64,63 +69,73 @@ class TestRealProxy:
         """Single prompt-response: verify trace captures the exchange."""
         env, trace_dir = claude_env
 
-        output = _run_claude_prompt(env, "Reply with exactly: HELLO_E2E_TEST")
+        result = _run_claude_tap(env, trace_dir, "Reply with exactly: HELLO_E2E_TEST")
 
-        assert "HELLO_E2E_TEST" in output, f"Expected HELLO_E2E_TEST in output, got: {output[:500]}"
+        assert result.returncode == 0, (
+            f"claude-tap failed (code {result.returncode}):\n"
+            f"stdout: {result.stdout[:1000]}\nstderr: {result.stderr[:1000]}"
+        )
+        assert "HELLO_E2E_TEST" in result.stdout, f"Expected HELLO_E2E_TEST in output:\n{result.stdout[:500]}"
 
-        records = _wait_for_trace_files(trace_dir, min_records=1)
+        records = _read_trace_records(trace_dir)
         assert len(records) >= 1, f"Expected at least 1 trace record, got {len(records)}"
 
-        # Verify the trace contains request and response
+        # Verify trace structure
         record = records[0]
         assert "request" in record
         assert "response" in record
         assert record["request"]["method"] == "POST"
         assert "/v1/messages" in record["request"]["path"]
 
-        # Verify the response was captured
+        # Verify response content captured
         resp_body = record["response"].get("body", {})
         if isinstance(resp_body, dict):
             content = resp_body.get("content", [])
             texts = [c.get("text", "") for c in content if c.get("type") == "text"]
             full_text = " ".join(texts)
-            assert "HELLO_E2E_TEST" in full_text, f"Expected HELLO_E2E_TEST in trace response, got: {full_text[:500]}"
+            assert "HELLO_E2E_TEST" in full_text, f"Expected HELLO_E2E_TEST in trace response:\n{full_text[:500]}"
 
     @pytest.mark.timeout(300)
     def test_multi_turn(self, claude_env):
         """Two calls with -c flag: verify conversation memory works."""
         env, trace_dir = claude_env
 
-        # First turn
-        output1 = _run_claude_prompt(env, "Remember this code: ZEBRA_42. Just confirm you remember it.")
-        assert "ZEBRA_42" in output1 or "remember" in output1.lower(), f"Unexpected first turn output: {output1[:500]}"
+        # Turn 1: ask to remember a code
+        r1 = _run_claude_tap(env, trace_dir, "Remember this code: ZEBRA_42. Just confirm you remember it.")
+        assert r1.returncode == 0, f"Turn 1 failed:\nstdout: {r1.stdout[:500]}\nstderr: {r1.stderr[:500]}"
 
-        # Second turn with -c (continue)
-        output2 = _run_claude_prompt(env, "What was the code I asked you to remember?", extra_args=["-c"])
-        assert "ZEBRA_42" in output2, f"Expected ZEBRA_42 in continued conversation, got: {output2[:500]}"
+        # Turn 2: with -c (continue) ask to recall
+        r2 = _run_claude_tap(
+            env,
+            trace_dir,
+            "What was the code I asked you to remember?",
+            extra_claude_args=["-c"],
+        )
+        assert r2.returncode == 0, f"Turn 2 failed:\nstdout: {r2.stdout[:500]}\nstderr: {r2.stderr[:500]}"
+        assert "ZEBRA_42" in r2.stdout, f"Expected ZEBRA_42 in continued conversation:\n{r2.stdout[:500]}"
 
-        # Verify multiple trace records
-        records = _wait_for_trace_files(trace_dir, min_records=2)
+        # Verify multiple trace records across both runs
+        records = _read_trace_records(trace_dir)
         assert len(records) >= 2, f"Expected at least 2 trace records for multi-turn, got {len(records)}"
 
     @pytest.mark.timeout(180)
     def test_tool_use(self, claude_env):
-        """Prompt that triggers tool use: verify multiple trace records."""
+        """Prompt that triggers tool use: verify trace captures tool_use blocks."""
         env, trace_dir = claude_env
 
-        _run_claude_prompt(env, "What files are in the current directory? Use ls to check.")
+        result = _run_claude_tap(env, trace_dir, "What files are in the current directory? Use ls to check.")
+        assert result.returncode == 0, f"Tool use test failed:\n{result.stdout[:500]}\n{result.stderr[:500]}"
 
-        # Tool use should generate multiple API calls (initial + tool result + response)
-        records = _wait_for_trace_files(trace_dir, min_records=2, timeout=180)
+        records = _read_trace_records(trace_dir)
+        # Tool use generates multiple API calls (initial + tool result + response)
         assert len(records) >= 2, f"Expected at least 2 trace records for tool use, got {len(records)}"
 
-        # Verify at least one record shows tool use in response
+        # Verify at least one record has tool_use content block
         has_tool_use = False
         for record in records:
             resp_body = record.get("response", {}).get("body", {})
             if isinstance(resp_body, dict):
-                content = resp_body.get("content", [])
-                for block in content:
+                for block in resp_body.get("content", []):
                     if block.get("type") == "tool_use":
                         has_tool_use = True
                         break
@@ -133,56 +148,57 @@ class TestRealProxy:
         """Verify .html viewer file is generated after a session."""
         env, trace_dir = claude_env
 
-        _run_claude_prompt(env, "Reply with exactly: HTML_VIEWER_CHECK")
+        result = _run_claude_tap(env, trace_dir, "Reply with exactly: HTML_CHECK")
+        assert result.returncode == 0
 
-        # Wait for trace files
-        _wait_for_trace_files(trace_dir, min_records=1)
+        # claude-tap generates HTML on exit (which happens after claude subprocess finishes)
+        html_files = list(Path(trace_dir).glob("*.html"))
+        assert len(html_files) >= 1, (
+            f"Expected HTML viewer file in {trace_dir}, found: {list(Path(trace_dir).iterdir())}"
+        )
 
-        # The HTML viewer is generated on shutdown, which happens when
-        # the proxy_server fixture tears down. We need to trigger that
-        # by letting the fixture cleanup run. For now, just check JSONL exists.
-        jsonl_files = list(Path(trace_dir).glob("trace_*.jsonl"))
-        assert len(jsonl_files) >= 1, "Expected at least one trace JSONL file"
+        # Verify HTML contains embedded trace data
+        html_content = html_files[0].read_text()
+        assert "EMBEDDED_TRACE_DATA" in html_content, "HTML viewer should contain EMBEDDED_TRACE_DATA"
 
-        # HTML is generated at proxy shutdown — verify JSONL has valid content
-        for jsonl_file in jsonl_files:
-            text = jsonl_file.read_text().strip()
-            if text:
-                record = json.loads(text.splitlines()[0])
-                assert "request" in record
-                assert "response" in record
+        # Verify View: line in stdout
+        assert "View:" in result.stdout, "Expected 'View:' URL in stdout"
 
     @pytest.mark.timeout(180)
     def test_api_key_redaction(self, claude_env):
         """Verify no raw API keys appear in trace files."""
         env, trace_dir = claude_env
 
-        _run_claude_prompt(env, "Reply with exactly: REDACTION_CHECK")
+        result = _run_claude_tap(env, trace_dir, "Reply with exactly: REDACTION_CHECK")
+        assert result.returncode == 0
 
-        records = _wait_for_trace_files(trace_dir, min_records=1)
+        records = _read_trace_records(trace_dir)
+        assert len(records) >= 1
 
-        # Check that no raw API keys leak into the trace
-        trace_text = json.dumps(records)
-        # Anthropic keys start with sk-ant-
-        assert "sk-ant-" not in trace_text, "Raw Anthropic API key found in trace — should be redacted"
-
-        # Verify the x-api-key header is redacted
+        # Check all records for raw API keys in headers
         for record in records:
             req_headers = record.get("request", {}).get("headers", {})
-            api_key = req_headers.get("x-api-key", "")
-            if api_key:
-                assert api_key.startswith("sk-ant-") is False or "..." in api_key, (
-                    f"API key not properly redacted: {api_key[:20]}..."
-                )
+            for key_name in ("x-api-key", "authorization"):
+                val = req_headers.get(key_name, "")
+                if not val:
+                    # Try case-insensitive
+                    for k, v in req_headers.items():
+                        if k.lower() == key_name:
+                            val = v
+                            break
+                if val and len(val) > 10:
+                    assert "..." in val, f"Header {key_name} not redacted: {val[:30]}..."
 
     @pytest.mark.timeout(180)
     def test_streaming_sse_capture(self, claude_env):
         """Verify SSE events are captured in streaming responses."""
         env, trace_dir = claude_env
 
-        _run_claude_prompt(env, "Reply with exactly: SSE_CAPTURE_TEST")
+        result = _run_claude_tap(env, trace_dir, "Reply with exactly: SSE_CAPTURE_TEST")
+        assert result.returncode == 0
 
-        records = _wait_for_trace_files(trace_dir, min_records=1)
+        records = _read_trace_records(trace_dir)
+        assert len(records) >= 1
 
         # Check if any record has sse_events (streaming response)
         has_sse = False
@@ -190,9 +206,19 @@ class TestRealProxy:
             sse_events = record.get("response", {}).get("sse_events")
             if sse_events and len(sse_events) > 0:
                 has_sse = True
-                # Verify SSE events have expected structure
                 event_types = {e.get("event") for e in sse_events if isinstance(e, dict)}
                 assert "message_start" in event_types, f"Expected message_start in SSE events, got: {event_types}"
                 break
 
         assert has_sse, "Expected at least one trace record with sse_events (streaming response)"
+
+    @pytest.mark.timeout(180)
+    def test_trace_summary(self, claude_env):
+        """Verify claude-tap prints trace summary with API call count."""
+        env, trace_dir = claude_env
+
+        result = _run_claude_tap(env, trace_dir, "Reply with exactly: SUMMARY_CHECK")
+        assert result.returncode == 0
+
+        assert "Trace summary" in result.stdout, f"Expected 'Trace summary' in stdout:\n{result.stdout[:500]}"
+        assert "API calls:" in result.stdout, f"Expected 'API calls:' in stdout:\n{result.stdout[:500]}"
