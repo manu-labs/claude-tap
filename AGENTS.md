@@ -96,12 +96,46 @@ Before every commit:
 
 ## Brain + Hands Protocol
 
-- **Claude Code (Opus)** = planning brain. Makes architecture decisions, designs APIs,
-  chooses patterns, reviews code.
-- **Codex** = execution hands. Writes boilerplate, runs commands, applies mechanical changes.
+- **Orchestrator (OpenClaw)** = brain. Makes architecture decisions, writes prompts,
+  validates results, handles git commit/push.
+- **Codex** = hands. **All code changes go through Codex.** It reads AGENTS.md,
+  follows project conventions, and avoids repeating past mistakes.
 
-Never delegate architecture decisions to execution tools. The brain decides *what* and *why*;
-the hands do *how*.
+Never hand-write code patches directly. Always delegate to Codex.
+
+### Why Codex
+
+1. **Specialized coding model** — `gpt-5.2-codex` is purpose-built for code.
+2. **Reads AGENTS.md** — automatically picks up project conventions, coding standards,
+   and lessons from error-experience/good-experience docs.
+3. **Compounds learning** — mistakes documented in `docs/error-experience/` are
+   avoided in future runs because Codex reads them.
+
+### tmux Launch Pattern
+
+Launch Codex in a tmux session for monitoring and mid-task steering:
+
+```bash
+# Start Codex in tmux
+tmux new-session -d -s codex-<task> -x 200 -y 50 \
+  -c /path/to/claude-tap \
+  "codex --dangerously-bypass-approvals-and-sandbox 'Read AGENTS.md first. <task description>'"
+
+# Monitor output
+tmux capture-pane -t codex-<task> -p | tail -30
+
+# Mid-task steering (if agent goes wrong direction)
+tmux send-keys -t codex-<task> "Focus on X, not Y." Enter
+
+# Exit
+tmux send-keys -t codex-<task> C-c
+```
+
+Benefits over direct exec:
+- `tmux attach` for real-time output
+- `tmux send-keys` for mid-task correction
+- SSH disconnect doesn't kill the agent
+- Multiple agents can run in parallel sessions
 
 ## Codex Sandbox Limitations
 
