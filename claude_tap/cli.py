@@ -126,18 +126,35 @@ async def run_claude(
         except OSError:
             pass
 
-    # Forward SIGINT to child (needed when child is NOT the foreground group)
+    # --- Signal handling: graceful Ctrl+C / Ctrl+Z ---
     loop = asyncio.get_running_loop()
 
-    def _fwd_signal():
-        if proc.returncode is None:
-            proc.send_signal(signal.SIGINT)
+    # Prevent Ctrl+Z from suspending the session
+    old_sigtstp = signal.signal(signal.SIGTSTP, signal.SIG_IGN)
 
-    if not use_fg:
-        try:
-            loop.add_signal_handler(signal.SIGINT, _fwd_signal)
-        except NotImplementedError:
-            pass
+    sigint_count = 0
+
+    def _handle_sigint():
+        nonlocal sigint_count
+        sigint_count += 1
+        if sigint_count == 1:
+            if proc.returncode is None:
+                proc.terminate()
+                print("\n⏳ Shutting down Claude Code... (Ctrl+C again to force)")
+        else:
+            if proc.returncode is None:
+                proc.kill()
+
+    def _handle_sigtstp():
+        if proc.returncode is None:
+            proc.terminate()
+            print("\n⏳ Shutting down Claude Code...")
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, _handle_sigint)
+        loop.add_signal_handler(signal.SIGTSTP, _handle_sigtstp)
+    except (NotImplementedError, OSError):
+        pass
 
     code = await proc.wait()
 
@@ -148,12 +165,16 @@ async def run_claude(
         except OSError:
             pass
 
-    # Remove signal handler so Ctrl+C works normally during cleanup
-    if not use_fg:
-        try:
-            loop.remove_signal_handler(signal.SIGINT)
-        except (NotImplementedError, OSError):
-            pass
+    # Restore original SIGTSTP handler and remove async signal handlers
+    signal.signal(signal.SIGTSTP, old_sigtstp)
+    try:
+        loop.remove_signal_handler(signal.SIGINT)
+    except (NotImplementedError, OSError):
+        pass
+    try:
+        loop.remove_signal_handler(signal.SIGTSTP)
+    except (NotImplementedError, OSError):
+        pass
 
     print(f"\n📋 Claude Code exited with code {code}")
     return code
@@ -329,7 +350,7 @@ async def async_main(args: argparse.Namespace):
         print(f"   Log:   {log_path}")
         print(f"   View:  {html_path}")
 
-        # Open viewer in browser if requested
+        # Open viewer in browser (default: auto-open unless --tap-no-open)
         if args.open_viewer and html_path.exists():
             print("\n🌐 Opening viewer in browser...")
             _open_browser(f"file://{html_path.absolute()}")
@@ -378,7 +399,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tap-no-launch", action="store_true", dest="no_launch", help="Only start the proxy, don't launch Claude"
     )
     tap_parser.add_argument(
-        "--tap-open", action="store_true", dest="open_viewer", help="Open HTML viewer in browser after exit"
+        "--tap-open",
+        action="store_true",
+        dest="open_viewer",
+        default=True,
+        help="Open HTML viewer in browser after exit (default: on)",
+    )
+    tap_parser.add_argument(
+        "--tap-no-open",
+        action="store_false",
+        dest="open_viewer",
+        help="Don't auto-open HTML viewer after exit",
     )
     tap_parser.add_argument(
         "--tap-live",
