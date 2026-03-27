@@ -20,7 +20,6 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.9,<4",
-    "backports-zstd>=1.0",
     "cryptography>=42.0",
 ]
 
@@ -40,7 +39,7 @@ build-backend = "setuptools.build_meta"
 packages = ["claude_tap"]
 
 [tool.setuptools.package-data]
-claude_tap = ["viewer.html", "py.typed"]
+claude_tap = []
 
 [project.optional-dependencies]
 dev = [
