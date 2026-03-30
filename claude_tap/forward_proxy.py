@@ -130,15 +130,10 @@ class ForwardProxyServer:
         # Look up route for this hostname
         route_url = self._routes.get(hostname)
         if self._routes and route_url is None:
-            # Host not in route table — reject
-            log.warning("CONNECT to unrouted host %s — rejecting", hostname)
-            # Read remaining headers
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=10)
-                if line in (b"\r\n", b"\n", b""):
-                    break
-            writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            await writer.drain()
+            # Host not in route table — passthrough as a plain TCP tunnel
+            # so non-proxied traffic (e.g. tool API calls) goes through
+            # without TLS termination or interception.
+            await self._handle_passthrough(hostname, port, reader, writer)
             return
 
         # Read and discard remaining headers until blank line
@@ -221,6 +216,68 @@ class ForwardProxyServer:
             try:
                 tls_writer.close()
                 await tls_writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _handle_passthrough(
+        self,
+        hostname: str,
+        port: int,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        """Plain TCP tunnel passthrough for unrouted hosts (no TLS termination)."""
+        # Read and discard remaining CONNECT headers
+        while True:
+            line = await asyncio.wait_for(client_reader.readline(), timeout=10)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+        # Connect to the real upstream
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(hostname, port),
+                timeout=15,
+            )
+        except Exception as exc:
+            log.warning("Passthrough connect to %s:%d failed: %s", hostname, port, exc)
+            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        # Tell the client the tunnel is established
+        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await client_writer.drain()
+
+        # Bidirectional pipe — client <-> upstream
+        async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                try:
+                    dst.close()
+                except Exception:
+                    pass
+
+        c2u = asyncio.create_task(_pipe(client_reader, upstream_writer))
+        u2c = asyncio.create_task(_pipe(upstream_reader, client_writer))
+
+        try:
+            await asyncio.gather(c2u, u2c)
+        except Exception:
+            c2u.cancel()
+            u2c.cancel()
+        finally:
+            try:
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
             except Exception:
                 pass
 
